@@ -304,6 +304,52 @@ loop:
 
 ---
 
+# Phase 6 — Reliable Echo (Write Backlog)
+
+## Goal
+
+Make echo **complete** under non-blocking sockets: every byte you read is eventually written, even when the kernel send buffer cannot take the full reply at once.
+
+## Why This Shows Up
+
+On a client socket:
+
+```text
+read()  may return WouldBlock → no inbound data yet
+write() may return WouldBlock → outbound buffer full (for now)
+write() may also return a short count → fewer bytes accepted than offered
+```
+
+A minimal loop often does:
+
+```rust
+write(&buffer[..])
+```
+
+If that stops early or hits `WouldBlock`, the remainder is **still part of what you owe the client**.
+
+## Challenge
+
+Implement one of these behaviors (Pick A for the full reactor shape, or Pick B if you prefer less kqueue surface area):
+
+### Pick A — Outbound queue + EVFILT_WRITE
+
+- Store per-client outbound bytes somewhere (For example extend your map value beyond `TcpStream`, or wrap both in a struct).
+- After a successful `read`, append the echoed bytes to that outbound queue and try `write` immediately in a drain loop until the queue is empty or you get `WouldBlock`.
+- Register the client's fd with `EVFILT_WRITE` **only while** outbound data remains; remove that registration (`EV_DELETE`) when the queue is empty so you do not spin on constant write-ready notifications when there is nothing to send.
+- In your `kevent` loop, use each event's **filter** to tell `EVFILT_READ` (data or accept ready) apart from `EVFILT_WRITE` (can send without blocking).
+
+### Pick B — Backlog without write events (Teaching shortcut)
+
+Keep a single pending send buffer per client, but flush it only when that fd wakes for `EVFILT_READ`. Document that this is **not fully correct**: read readiness does not imply write readiness, but it is simpler to sketch.
+
+## Success Criteria
+
+- Large reads or slow readers no longer silently drop tails of echoed data (For Pick A; Pick B explicitly documents its limitations).
+- You can explain why `TcpStream::write_all` is a poor fit for a non-blocking event loop unless you isolate blocking work.
+
+---
+
 # Important Concepts to Observe
 
 ## 1. kqueue Does Not Hold Data
